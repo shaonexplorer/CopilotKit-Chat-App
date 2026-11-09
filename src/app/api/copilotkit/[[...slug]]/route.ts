@@ -12,6 +12,10 @@ const runtime = new CopilotRuntime({
       graphId: "default",
     }),
   },
+  // Enable thread clearing for all callers (for development)
+  threads: {
+    access: "open",
+  },
 });
 
 const handler = createCopilotRuntimeHandler({

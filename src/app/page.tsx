@@ -30,6 +30,14 @@ interface AppointmentProps {
   respond?: (response: string) => void;
 }
 
+export const WeatherCard = ({ city }: propType) => {
+  return (
+    <div className="max-w-[300px] max-h-[400px] rounded-2xl bg-slate-300/50 p-4 text-black">
+      The weather in {city} is 18 Degree Celsius
+    </div>
+  );
+};
+
 export const Appointment: React.FC<AppointmentProps> = ({
   args,
   status,
@@ -61,7 +69,11 @@ export const Appointment: React.FC<AppointmentProps> = ({
 
         <div className="flex items-center gap-2 pt-1">
           <button
-            onClick={() => respond?.(`Appointment booked at ${selected}`)}
+            onClick={() =>
+              respond?.(
+                `Appointment suucessfully booked at time: ${selected} with the selected Doctor`,
+              )
+            }
             disabled={!selected || status == "completed"}
             className="w-full py-2 px-3 rounded-xl bg-green-600 text-white font-medium text-xs disabled:opacity-40 disabled:cursor-not-allowed hover:bg-green-700 transition-colors"
           >

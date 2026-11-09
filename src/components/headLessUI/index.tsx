@@ -1,8 +1,20 @@
 "use client";
 
 import * as React from "react";
-
-import type { UIDataTypes, UIMessage } from "ai";
+import {
+  useAgent,
+  useComponent,
+  useCopilotKit,
+  useCopilotChatConfiguration,
+  useFrontendTool,
+  useRenderTool,
+  useRenderToolCall,
+} from "@copilotkit/react-core/v2";
+import type {
+  Message as AgentMessage,
+  ToolCall,
+  ToolMessage,
+} from "@ag-ui/core";
 import {
   ArrowUpIcon,
   CircleCheckIcon,
@@ -12,12 +24,11 @@ import {
   PaperclipIcon,
   PlusIcon,
   RotateCwIcon,
+  SquareIcon,
   TelescopeIcon,
   TerminalIcon,
 } from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
-
-// import { MESSAGE_ANIMATIONS } from "@/lib/message-animations";
 
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -68,52 +79,109 @@ import {
   TraceLine,
   TraceTitle,
 } from "@/components/ui/trace";
-import {
-  useAgent,
-  useCopilotKit,
-  useHumanInTheLoop,
-} from "@copilotkit/react-core/v2";
+import { useHumanInTheLoop } from "@copilotkit/react-core/v2";
 
 import z from "zod";
-import { Appointment } from "@/app/page";
+import { Appointment, WeatherCard } from "@/app/page";
 
-type ChatMessage = UIMessage<
-  unknown,
-  UIDataTypes,
-  {
-    runCommand: {
-      input: { command: string };
-      output: { stdout: string };
-    };
+type ReasoningStep = { kind: "reasoning"; id: string; text: string };
+type ToolStep = {
+  kind: "tool";
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+  output?: string;
+  toolCall: ToolCall; // raw call, needed by renderToolCall
+  toolMessage?: ToolMessage; // raw result, once it exists
+};
+type Step = ReasoningStep | ToolStep;
+type Turn =
+  | { kind: "user"; id: string; text: string }
+  | { kind: "assistant"; id: string; steps: Step[]; reply: string };
+
+function getText(m: AgentMessage): string {
+  const c = (m as { content?: unknown }).content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c))
+    return c.map((p) => (p?.type === "text" ? p.text : "")).join("");
+  return "";
+}
+
+function safeParse(json: string) {
+  try {
+    return JSON.parse(json || "{}");
+  } catch {
+    return {}; // partial JSON while args are still streaming
   }
->;
+}
 
-type ChatPart = ChatMessage["parts"][number];
+function toTurns(messages: AgentMessage[]): Turn[] {
+  const turns: Turn[] = [];
+  for (const m of messages) {
+    if (m.role === "user") {
+      turns.push({ kind: "user", id: m.id, text: getText(m) });
+      continue;
+    }
+    if (m.role === "system" || m.role === "developer" || m.role === "activity")
+      continue;
 
-type ToolPart = Extract<ChatPart, { type: "tool-runCommand" }>;
+    let turn = turns.at(-1);
+    if (!turn || turn.kind !== "assistant") {
+      turn = { kind: "assistant", id: m.id, steps: [], reply: "" };
+      turns.push(turn);
+    }
 
-// const initialMessages = chat.get(0);
-// const transport = chat.transport({
-//   delayMs: 16,
-//   fallback:
-//     "This demo only knows the scripted turns. Press reset to start over.",
-// });
+    if (m.role === "reasoning") {
+      turn.steps.push({ kind: "reasoning", id: m.id, text: getText(m) });
+    } else if (m.role === "assistant") {
+      for (const call of m.toolCalls ?? []) {
+        turn.steps.push({
+          kind: "tool",
+          id: call.id,
+          name: call.function.name,
+          args: safeParse(call.function.arguments),
+          toolCall: call,
+        });
+      }
+      const t = getText(m);
+      if (t) turn.reply += (turn.reply ? "\n\n" : "") + t;
+    } else if (m.role === "tool") {
+      const step = turn.steps.find(
+        (s): s is ToolStep => s.kind === "tool" && s.id === m.toolCallId,
+      );
+      if (step) {
+        step.output = getText(m);
+        step.toolMessage = m as ToolMessage;
+      }
+    }
+  }
+  return turns;
+}
 
 const MotionMessageScrollerItem = motion.create(MessageScrollerItem);
 
 export function ChatDemo() {
-  //   const { messages, sendMessage, setMessages, status } = useChat({
-  //     messages: initialMessages,
-  //     transport,
-  //   });
-
   const { agent } = useAgent();
-
-  console.log({ messages: agent.messages });
-
   const { copilotkit } = useCopilotKit();
 
   const [input, setInput] = React.useState("");
+  const formRef = React.useRef<HTMLFormElement>(null);
+  const shouldReduceMotion = useReducedMotion();
+
+  const renderToolCall = useRenderToolCall();
+
+  useFrontendTool({
+    name: "view_weather_card",
+    description:
+      "Display a weather card to the user. Call this ONCE per city. After it is called, the card is already visible, so do not call it again.",
+    parameters: z.object({
+      city: z.string().describe("the name of the city"),
+    }),
+    handler: async ({ city }) =>
+      `Weather card for ${city} is now displayed to the user.`,
+    render: ({ args }) => <WeatherCard city={args.city!} />,
+    // followUp: false, // if your version supports it, this stops the agent re-running after the tool
+  });
 
   useHumanInTheLoop({
     agentId: "default",
@@ -130,37 +198,32 @@ export function ChatDemo() {
     ),
   });
 
-  const formRef = React.useRef<HTMLFormElement>(null);
-  const shouldReduceMotion = useReducedMotion();
-  //   const nextMessage = chat.next(messages);
   const busy = agent.isRunning;
-  //   const text = draft ?? (nextMessage ? getMessageText(nextMessage) : "");
+  const turns = toTurns(agent.messages);
   const canSend = input.trim().length > 0 && !busy;
 
-  const onSubmit = React.useCallback(
-    async (e: React.FormEvent) => {
-      e.preventDefault();
-      if (!input.trim() || agent.isRunning) return;
+  // console.log(agent.isRunning);
+  console.log(agent.messages);
+  console.log({ turns });
 
-      // 1. Add user message to agent state
-      agent.addMessage({
-        // id: randomUUID(),
-        id: crypto.randomUUID(),
-        role: "user",
-        content: input,
-      });
-
-      setInput("");
-
-      // 2. Stream execution from backend agent framework (e.g., LangGraph)
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!canSend) return;
+    const content = input.trim();
+    setInput("");
+    agent.addMessage({ id: crypto.randomUUID(), role: "user", content });
+    try {
       await copilotkit.runAgent({ agent });
-    },
-    [input, agent, copilotkit],
-  );
+    } catch (err) {
+      console.error("runAgent failed", err);
+    }
+  }
 
-  const stopAgent = React.useCallback(() => {
-    copilotkit.stopAgent({ agent });
-  }, [agent, copilotkit]);
+  function onReset() {
+    if (agent.isRunning) agent.abortRun?.(); // stop an in-flight run first
+    agent.setMessages([]); // clear the UI
+    agent.threadId = crypto.randomUUID(); // fresh LangGraph thread
+  }
 
   return (
     <MessageScrollerProvider>
@@ -180,7 +243,7 @@ export function ChatDemo() {
                     variant="outline"
                     size="icon"
                     aria-label="Reset conversation"
-                    onClick={() => {}}
+                    onClick={onReset}
                     disabled={busy}
                   >
                     <RotateCwIcon />
@@ -193,7 +256,7 @@ export function ChatDemo() {
             </Tooltip>
           </div>
           <div className="min-h-0 flex-1">
-            {agent.messages.length === 0 ? (
+            {turns.length === 0 ? (
               <Empty className="h-full">
                 <EmptyHeader>
                   <EmptyMedia variant="icon">
@@ -213,70 +276,68 @@ export function ChatDemo() {
                     aria-busy={busy}
                     className="gap-6 px-8 py-0"
                   >
-                    {agent.messages.map((message) => {
-                      if (message.role === "user") {
+                    {turns.map((turn, i) => {
+                      if (turn.kind === "user") {
                         return (
                           <MotionMessageScrollerItem
-                            key={message.id}
-                            messageId={message.id}
+                            key={turn.id}
+                            messageId={turn.id}
                             scrollAnchor
-                            // variants={MESSAGE_ANIMATIONS["slide-up"].variants}
                             initial={shouldReduceMotion ? false : "initial"}
                             animate="animate"
                           >
                             <Message align="end">
                               <MessageContent>
                                 <Bubble align="end" variant="muted">
-                                  <BubbleContent>
-                                    {/* {getMessageText(message)} */}
-                                    {message.content}
-                                  </BubbleContent>
+                                  <BubbleContent>{turn.text}</BubbleContent>
                                 </Bubble>
                               </MessageContent>
                             </Message>
                           </MotionMessageScrollerItem>
                         );
                       }
-
-                      //   const streaming = busy && message === messages.at(-1);
-                      const streaming = agent.isRunning;
-
-                      //   const steps = message?.content?.filter(
-                      //     (part) =>
-                      //       part.type === "reasoning" ||
-                      //       part.type === "tool-runCommand",
-                      //   );
-                      //   const reply = getMessageText(message);
-
-                      const reply =
-                        (message?.toolCalls || message?.toolCallId) &&
-                        message.role !== "tool" &&
-                        message.content;
-
-                      const steps = !message?.toolCalls && message;
-
-                      //   const steps = message?.role == "reasoning" && message;
-
-                      //   const reply = message.content;
-
+                      const streaming = busy && i === turns.length - 1;
                       return (
-                        <MessageScrollerItem
-                          key={message.id}
-                          messageId={message.id}
-                        >
+                        <MessageScrollerItem key={turn.id} messageId={turn.id}>
                           <Message>
                             <MessageContent className="gap-3">
                               <Trace>
                                 <ReasoningRow
+                                  text={"Thinking"}
                                   running={streaming}
-                                  text={steps.content}
                                 />
                               </Trace>
 
-                              {reply && (
+                              {turn.steps.length > 0 && (
+                                <Trace>
+                                  {turn.steps.map((step, j) => (
+                                    <StepRow
+                                      key={step.id}
+                                      step={step}
+                                      streaming={streaming}
+                                      isLast={
+                                        j === turn.steps.length - 1 &&
+                                        !turn.reply
+                                      }
+                                    />
+                                  ))}
+                                </Trace>
+                              )}
+                              {turn.reply && (
                                 <Markdown remarkPlugins={[remarkGfm]}>
-                                  {reply}
+                                  {turn.reply}
                                 </Markdown>
+                              )}
+
+                              {turn.steps.map((step) =>
+                                step.kind === "tool" ? (
+                                  <React.Fragment key={step.id}>
+                                    {renderToolCall({
+                                      toolCall: step.toolCall,
+                                      toolMessage: step.toolMessage,
+                                    })}
+                                  </React.Fragment>
+                                ) : null,
                               )}
                             </MessageContent>
                           </Message>
@@ -339,16 +400,27 @@ export function ChatDemo() {
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
-                  <InputGroupButton
-                    type="submit"
-                    variant="default"
-                    size="icon-sm"
-                    disabled={!canSend}
-                    className="ml-auto"
-                  >
-                    <ArrowUpIcon />
-                    <span className="sr-only">Send</span>
-                  </InputGroupButton>
+                  {busy ? (
+                    <InputGroupButton
+                      type="button"
+                      size="icon-sm"
+                      className="ml-auto"
+                      onClick={() => copilotkit.stopAgent({ agent })}
+                    >
+                      <SquareIcon />
+                    </InputGroupButton>
+                  ) : (
+                    <InputGroupButton
+                      type="submit"
+                      variant="default"
+                      size="icon-sm"
+                      disabled={!canSend}
+                      className="ml-auto"
+                    >
+                      <ArrowUpIcon />
+                      <span className="sr-only">Send</span>
+                    </InputGroupButton>
+                  )}
                 </InputGroupAddon>
               </InputGroup>
             </form>
@@ -359,10 +431,53 @@ export function ChatDemo() {
   );
 }
 
-function StepRow({ part, streaming }: { part: ChatPart; streaming: boolean }) {
-  return <ToolRow part={part} streaming={streaming} />;
+function StepRow({
+  step,
+  streaming,
+  isLast,
+}: {
+  step: Step;
+  streaming: boolean;
+  isLast: boolean;
+}) {
+  if (step.kind !== "tool")
+    return (
+      <ReasoningRow
+        text={step.text ?? "Thinking"}
+        running={streaming && isLast}
+      />
+    );
 
-  return null;
+  return <ToolRow step={step} streaming={streaming} />;
+}
+
+function ToolRow({ step, streaming }: { step: ToolStep; streaming: boolean }) {
+  const label =
+    typeof step.args.command === "string" ? step.args.command : step.name;
+
+  // console.log({ [label]: step.output });
+
+  return (
+    <TraceCollapsible>
+      <TraceCollapsibleTrigger>
+        <TraceLine>
+          <TraceIcon>
+            <TerminalIcon />
+          </TraceIcon>
+          <TraceTitle>Ran {label}</TraceTitle>
+        </TraceLine>
+      </TraceCollapsibleTrigger>
+      <TraceCollapsibleContent>
+        {step.output && (
+          <CodeBlock size="sm">
+            <CodeBlockContent wrap className="max-h-64">
+              {step.output}
+            </CodeBlockContent>
+          </CodeBlock>
+        )}
+      </TraceCollapsibleContent>
+    </TraceCollapsible>
+  );
 }
 
 function ReasoningRow({ text, running }: { text: string; running: boolean }) {
@@ -383,23 +498,8 @@ function ReasoningRow({ text, running }: { text: string; running: boolean }) {
         </TraceLine>
       </TraceCollapsibleTrigger>
       <TraceCollapsibleContent className="whitespace-pre-wrap">
-        {text}
+        {/* {text} */}
       </TraceCollapsibleContent>
     </TraceCollapsible>
-  );
-}
-
-function ToolRow({ part, streaming }: { part: ToolPart; streaming: boolean }) {
-  const command = part.name;
-
-  return (
-    <TraceLine status={streaming ? "running" : "error"}>
-      <TraceIcon>
-        <TerminalIcon />
-      </TraceIcon>
-      <TraceTitle>
-        {streaming ? "Running" : "Failed to run"} {command}
-      </TraceTitle>
-    </TraceLine>
   );
 }
