@@ -3,11 +3,7 @@
 import * as React from "react";
 import {
   useAgent,
-  useComponent,
   useCopilotKit,
-  useCopilotChatConfiguration,
-  useFrontendTool,
-  useRenderTool,
   useRenderToolCall,
 } from "@copilotkit/react-core/v2";
 import type {
@@ -82,7 +78,10 @@ import {
 import { useHumanInTheLoop } from "@copilotkit/react-core/v2";
 
 import z from "zod";
-import { Appointment, WeatherCard } from "@/app/page";
+
+import ViewDoctors from "../controlled-components/view-doctors";
+import ViewSlots from "../controlled-components/view-slots";
+import ConfirmAppointment from "../controlled-components/confirm_appointment";
 
 type ReasoningStep = { kind: "reasoning"; id: string; text: string };
 type ToolStep = {
@@ -170,31 +169,63 @@ export function ChatDemo() {
 
   const renderToolCall = useRenderToolCall();
 
-  useFrontendTool({
-    name: "view_weather_card",
-    description:
-      "Display a weather card to the user. Call this ONCE per city. After it is called, the card is already visible, so do not call it again.",
+  useHumanInTheLoop({
+    agentId: "default",
+    name: "view_doctors_list",
+    description: "This tool is used to display list of doctors in card format",
     parameters: z.object({
-      city: z.string().describe("the name of the city"),
+      doctors: z.array(
+        z.object({
+          id: z.string().describe("id of the doctor"),
+          name: z.string().describe("name of the doctor"),
+          speciality: z.string().describe("speciality of the doctor"),
+          fee: z.string().describe("Appointment Fee of the doctor"),
+        }),
+      ),
     }),
-    handler: async ({ city }) =>
-      `Weather card for ${city} is now displayed to the user.`,
-    render: ({ args }) => <WeatherCard city={args.city!} />,
-    // followUp: false, // if your version supports it, this stops the agent re-running after the tool
+    render: ({ args, status, respond }) => (
+      <ViewDoctors
+        args={args.doctors ?? []}
+        status={status}
+        respond={respond}
+      />
+    ),
   });
 
   useHumanInTheLoop({
     agentId: "default",
-    name: "book_appointment",
+    name: "view_slots_for_appointment",
     description:
-      "Ask the user to pick a available time slot for appointment. The picker UI presents available slots; the user's choice is returned to the agent.",
+      "view the available slots for appointment from the search result with  selected_doctor id and selected_appointment_date stored in the state so that the patient can make appointment",
     parameters: z.object({
       slots: z
-        .array(z.string())
+        .array(
+          z.object({
+            startTime: z.string().describe("appointment start time"),
+            slotId: z.string().describe("slot id"),
+          }),
+        )
         .describe("available time slots for appointment"),
+      doctorName: z.string().describe("Name of the doctor"),
+      doctorId: z.string().describe("id of the doctor"),
     }),
     render: ({ args, status, respond }) => (
-      <Appointment args={args} status={status} respond={respond} />
+      <ViewSlots args={args} status={status} respond={respond} />
+    ),
+  });
+
+  useHumanInTheLoop({
+    agentId: "default",
+    name: "get_appointment_confirmation",
+    description:
+      "This tool is used to get confirmation from user prior to make/book final appointment",
+    parameters: z.object({
+      doctor: z.object({
+        name: z.string().describe("name of the doctor"),
+      }),
+    }),
+    render: ({ args, status, respond }) => (
+      <ConfirmAppointment args={args} status={status} respond={respond} />
     ),
   });
 
@@ -204,7 +235,7 @@ export function ChatDemo() {
 
   // console.log(agent.isRunning);
   console.log(agent.messages);
-  console.log({ turns });
+  // console.log({ turns });
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -227,7 +258,7 @@ export function ChatDemo() {
 
   return (
     <MessageScrollerProvider>
-      <div className="relative flex max-w-2xl w-full flex-col gap-4 [[data-slot=preview]:has(&)]:bg-background [[data-slot=preview]:has(&)>div]:p-0!">
+      <div className="bg-zinc-100/50 relative flex max-w-2xl w-full flex-col gap-4 [[data-slot=preview]:has(&)]:bg-background [[data-slot=preview]:has(&)>div]:p-0!">
         <div className="flex h-200 w-full flex-col gap-4">
           <div className="flex items-start justify-between gap-4 p-8 pb-4">
             <div className="flex flex-col gap-1">
